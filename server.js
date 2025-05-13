@@ -58,122 +58,136 @@ app.post(
     }
   }
 );
+
 // Track rooms and participants
 const activeRooms = new Map();
 
 io.on("connection", (socket) => {
   console.log("User connected:", socket.id);
 
+  // Create a new room
   socket.on("create-room", ({ roomId, appointmentDetails }) => {
-    activeRooms.set(roomId, {
-      doctor: null,
-      participants: new Map(),
-      appointmentDetails,
-    });
-    console.log(`Room ${roomId} created`);
+    if (!activeRooms.has(roomId)) {
+      activeRooms.set(roomId, {
+        doctor: null,
+        participants: new Map(),
+        appointmentDetails,
+      });
+      console.log(`Room ${roomId} created`);
+      socket.emit("room-created", { roomId });
+    } else {
+      socket.emit("room-exists", { roomId });
+    }
   });
 
+  // Patient joins room
   socket.on("join-as-participant", ({ roomId, name }) => {
-    if (!activeRooms.has(roomId)) {
+    const room = activeRooms.get(roomId);
+    if (!room) {
       socket.emit("room-not-found");
       return;
     }
 
-    const room = activeRooms.get(roomId);
     room.participants.set(socket.id, { name });
     socket.join(roomId);
-    socket.data = { roomId, isDoctor: false };
+    socket.data = { roomId, isDoctor: false, name };
 
-    // Notify participant about room status
+    console.log(`Participant ${name} joined room ${roomId}`);
+
     if (room.doctor) {
-      socket.emit("doctor-present");
+      socket.emit("doctor-present", { doctorName: room.doctor.name });
+      io.to(room.doctor.socketId).emit("user-joined", { id: socket.id, name });
     } else {
       socket.emit("waiting-for-doctor");
     }
   });
 
+  // Doctor joins room
   socket.on("join-as-doctor", ({ roomId, name }) => {
-    if (!activeRooms.has(roomId)) {
+    const room = activeRooms.get(roomId);
+    if (!room) {
       socket.emit("room-not-found");
       return;
     }
 
-    const room = activeRooms.get(roomId);
     room.doctor = { socketId: socket.id, name };
     socket.join(roomId);
-    socket.data = { roomId, isDoctor: true };
+    socket.data = { roomId, isDoctor: true, name };
+
+    console.log(`Doctor ${name} joined room ${roomId}`);
 
     // Notify all participants
     socket.to(roomId).emit("doctor-joined", { name });
 
-    // Send list of participants to doctor
+    // Send participants list to doctor
     const participants = Array.from(room.participants.entries()).map(
       ([id, data]) => ({ id, name: data.name })
     );
     socket.emit("current-participants", participants);
   });
 
-  socket.on("join-room", ({ roomId, name, isDoctor }) => {
-    socket.join(roomId);
-    socket.data = {
-      name,
-      isDoctor,
-      roomId,
-    };
+  // WebRTC signaling
+  socket.on("offer", ({ target, sdp }) => {
+    socket.to(target).emit("offer", {
+      sdp,
+      sender: socket.id,
+    });
+  });
 
-    if (isDoctor) {
-      // Notify all participants that doctor has joined
-      socket.to(roomId).emit("doctor-joined");
-      console.log(`Doctor ${name} joined room ${roomId}`);
-    } else {
-      // Notify doctor that user joined
-      const doctorSockets = Array.from(io.sockets.sockets.values()).filter(
-        (s) => s.data.isDoctor && s.data.roomId === roomId
-      );
+  socket.on("answer", ({ target, sdp }) => {
+    socket.to(target).emit("answer", {
+      sdp,
+      sender: socket.id,
+    });
+  });
 
-      if (doctorSockets.length > 0) {
-        socket.to(doctorSockets[0].id).emit("user-joined", {
-          id: socket.id,
-          name,
-        });
+  socket.on("ice-candidate", ({ target, candidate }) => {
+    socket.to(target).emit("ice-candidate", {
+      candidate,
+      sender: socket.id,
+    });
+  });
+
+  // Leaving room
+  socket.on("leave-room", () => {
+    const { roomId } = socket.data || {};
+    if (!roomId) return;
+
+    const room = activeRooms.get(roomId);
+    if (room) {
+      if (socket.data.isDoctor) {
+        room.doctor = null;
+        socket.to(roomId).emit("doctor-left");
+        console.log(`Doctor left room ${roomId}`);
       } else {
-        // No doctor in room yet
-        socket.emit("waiting-for-doctor");
+        room.participants.delete(socket.id);
+        socket.to(roomId).emit("user-left", { id: socket.id });
+        console.log(`Participant left room ${roomId}`);
       }
     }
 
-    socket.on("offer", (data) => {
-      socket.to(data.target).emit("offer", {
-        sdp: data.sdp,
-        sender: socket.id,
-      });
-    });
+    socket.leave(roomId);
+  });
 
-    socket.on("answer", (data) => {
-      socket.to(data.target).emit("answer", {
-        sdp: data.sdp,
-        sender: socket.id,
-      });
-    });
+  // Handle disconnect
+  socket.on("disconnect", () => {
+    const { roomId } = socket.data || {};
+    if (!roomId) return;
 
-    socket.on("leave-room", (room) => {
-      socket.leave(room);
-      io.to(room).emit("user-left", socket.id);
-    });
-
-    socket.on("ice-candidate", (data) => {
-      socket.to(data.target).emit("ice-candidate", {
-        candidate: data.candidate,
-        sender: socket.id,
-      });
-    });
-
-    socket.on("disconnect", () => {
+    const room = activeRooms.get(roomId);
+    if (room) {
       if (socket.data.isDoctor) {
+        room.doctor = null;
         socket.to(roomId).emit("doctor-left");
+        console.log(`Doctor disconnected from room ${roomId}`);
+      } else {
+        room.participants.delete(socket.id);
+        socket.to(roomId).emit("user-left", { id: socket.id });
+        console.log(`Participant disconnected from room ${roomId}`);
       }
-      socket.to(roomId).emit("user-left", { id: socket.id });
-    });
+    }
+
+    socket.leave(roomId);
   });
 });
 

@@ -1,20 +1,24 @@
 const express = require("express");
-const app = express();
-const server = require("http").createServer(app);
+const http = require("http");
+const { Server } = require("socket.io");
+const { config } = require("dotenv");
 const { BlobServiceClient } = require("@azure/storage-blob");
-const cors = require("cors");
 const multer = require("multer");
+const cors = require("cors");
 
-const io = require("socket.io")(server, {
-  cors: {
-    origin: "*",
-    methods: ["GET", "POST"],
-  },
-});
+config();
 
+const CORS_ORIGIN_BASE_URL =
+  process.env.CORS_ORIGIN_BASE_URL || "http://localhost:3000";
+const PORT = 8080;
+
+const app = express();
 app.use(cors());
 
-const PORT = process.env.PORT || 8080;
+const httpServer = http.createServer(app);
+const io = new Server(httpServer, {
+  cors: { origin: CORS_ORIGIN_BASE_URL },
+});
 
 app.get("/", (req, res) => {
   res.send("Hello World");
@@ -59,136 +63,101 @@ app.post(
   }
 );
 
-// Track rooms and participants
-const activeRooms = new Map();
+const rooms = {}; // { [roomId]: [{ socketId, nickname }] }
 
 io.on("connection", (socket) => {
   console.log("User connected:", socket.id);
 
   // Create a new room
-  socket.on("create-room", ({ roomId, appointmentDetails }) => {
-    if (!activeRooms.has(roomId)) {
-      activeRooms.set(roomId, {
-        doctor: null,
-        participants: new Map(),
-        appointmentDetails,
+  socket.on("createRoom", ({ roomId, nickname }) => {
+    if (!rooms[roomId]) {
+      rooms[roomId] = [{ socketId: socket.id, nickname }];
+      console.log(`Room ${roomId} created by ${nickname}`);
+      socket.emit("roomCreated", { roomId });
+    } else {
+      socket.emit("roomExists", { roomId });
+    }
+  });
+
+  socket.on("joinRoom", (args) => {
+    const { roomId, nickname } = args;
+
+    if (rooms[roomId]) rooms[roomId].push({ socketId: socket.id, nickname });
+    else rooms[roomId] = [{ socketId: socket.id, nickname }];
+
+    const otherUser = rooms[roomId].find((item) => item.socketId !== socket.id);
+
+    if (otherUser && otherUser.socketId !== socket.id) {
+      socket.to(otherUser.socketId).emit("userJoined", {
+        otherUserSocketId: socket.id,
+        otherUserNickname: nickname,
       });
-      console.log(`Room ${roomId} created`);
-      socket.emit("room-created", { roomId });
-    } else {
-      socket.emit("room-exists", { roomId });
+      socket.emit("waitingToBeAcceptedBy", otherUser.nickname);
+    }
+    console.log("joinRoom rooms: ", rooms);
+  });
+
+  socket.on("callAccepted", (args) => {
+    const { roomId, nickname } = args;
+
+    const room = rooms[roomId];
+    const otherUser = room.find((item) => item.socketId !== socket.id);
+    if (otherUser) {
+      socket.emit("otherUserId", {
+        otherUserSocketId: otherUser.socketId,
+        otherUserNickname: otherUser.nickname,
+      });
+      socket.to(otherUser.socketId).emit("acceptedBy", nickname);
     }
   });
 
-  // Patient joins room
-  socket.on("join-as-participant", ({ roomId, name }) => {
-    const room = activeRooms.get(roomId);
-    if (!room) {
-      socket.emit("room-not-found");
-      return;
-    }
-
-    room.participants.set(socket.id, { name });
-    socket.join(roomId);
-    socket.data = { roomId, isDoctor: false, name };
-
-    console.log(`Participant ${name} joined room ${roomId}`);
-
-    if (room.doctor) {
-      socket.emit("doctor-present", { doctorName: room.doctor.name });
-      io.to(room.doctor.socketId).emit("user-joined", { id: socket.id, name });
-    } else {
-      socket.emit("waiting-for-doctor");
-    }
+  socket.on("offer", (payload) => {
+    io.to(payload.target).emit("offer", payload);
   });
 
-  // Doctor joins room
-  socket.on("join-as-doctor", ({ roomId, name }) => {
-    const room = activeRooms.get(roomId);
-    if (!room) {
-      socket.emit("room-not-found");
-      return;
-    }
-
-    room.doctor = { socketId: socket.id, name };
-    socket.join(roomId);
-    socket.data = { roomId, isDoctor: true, name };
-
-    console.log(`Doctor ${name} joined room ${roomId}`);
-
-    // Notify all participants
-    socket.to(roomId).emit("doctor-joined", { name });
-
-    // Send participants list to doctor
-    const participants = Array.from(room.participants.entries()).map(
-      ([id, data]) => ({ id, name: data.name })
-    );
-    socket.emit("current-participants", participants);
+  socket.on("answer", (payload) => {
+    io.to(payload.target).emit("answer", payload);
   });
 
-  // WebRTC signaling
-  socket.on("offer", ({ target, sdp }) => {
-    socket.to(target).emit("offer", {
-      sdp,
-      sender: socket.id,
-    });
+  socket.on("ICECandidate", (payload) => {
+    io.to(payload.target).emit("ICECandidate", payload.candidate);
   });
 
-  socket.on("answer", ({ target, sdp }) => {
-    socket.to(target).emit("answer", {
-      sdp,
-      sender: socket.id,
-    });
-  });
-
-  socket.on("ice-candidate", ({ target, candidate }) => {
-    socket.to(target).emit("ice-candidate", {
-      candidate,
-      sender: socket.id,
-    });
-  });
-
-  // Leaving room
-  socket.on("leave-room", () => {
-    const { roomId } = socket.data || {};
-    if (!roomId) return;
-
-    const room = activeRooms.get(roomId);
-    if (room) {
-      if (socket.data.isDoctor) {
-        room.doctor = null;
-        socket.to(roomId).emit("doctor-left");
-        console.log(`Doctor left room ${roomId}`);
-      } else {
-        room.participants.delete(socket.id);
-        socket.to(roomId).emit("user-left", { id: socket.id });
-        console.log(`Participant left room ${roomId}`);
+  socket.on("disconnect", (reason) => {
+    let roomId = null;
+    for (let id in rooms) {
+      const found = rooms[id].find((item) => item.socketId === socket.id);
+      if (found) {
+        roomId = id;
+        break;
       }
     }
-
-    socket.leave(roomId);
+    if (roomId) {
+      const room = rooms[roomId];
+      const otherUser = room.find((item) => item.socketId !== socket.id);
+      rooms[roomId] = rooms[roomId].filter((el) => el.socketId !== socket.id);
+      if (otherUser)
+        socket
+          .to(otherUser.socketId)
+          .emit("otherUserDisconnected", otherUser.nickname);
+    }
+    console.log("disconnect rooms: ", rooms);
   });
 
-  // Handle disconnect
-  socket.on("disconnect", () => {
-    const { roomId } = socket.data || {};
-    if (!roomId) return;
+  socket.on("callRejected", (args) => {
+    const { roomId, nickname } = args;
 
-    const room = activeRooms.get(roomId);
-    if (room) {
-      if (socket.data.isDoctor) {
-        room.doctor = null;
-        socket.to(roomId).emit("doctor-left");
-        console.log(`Doctor disconnected from room ${roomId}`);
-      } else {
-        room.participants.delete(socket.id);
-        socket.to(roomId).emit("user-left", { id: socket.id });
-        console.log(`Participant disconnected from room ${roomId}`);
-      }
+    const otherUser = rooms[roomId].find((el) => el.socketId !== socket.id);
+    if (otherUser) {
+      rooms[roomId] = rooms[roomId].filter(
+        (el) => el.socketId !== otherUser.socketId
+      );
+      socket.to(otherUser.socketId).emit("callRejected", nickname);
     }
-
-    socket.leave(roomId);
+    console.log("callRejected rooms: ", rooms);
   });
 });
 
-server.listen(PORT, () => console.log(`Server is running on port ${PORT}`));
+httpServer.listen(PORT, () =>
+  console.log(`server is running on port: ${PORT}`)
+);

@@ -63,16 +63,16 @@ app.post(
   }
 );
 
-const rooms = {}; // { [roomId]: [{ socketId, nickname }] }
+const rooms = {}; // { [roomId]: [{ socketId, nickname, role }] }
 
 io.on("connection", (socket) => {
   console.log("User connected:", socket.id);
 
   // Create a new room
-  socket.on("createRoom", ({ roomId, nickname }) => {
+  socket.on("createRoom", ({ roomId, nickname, role }) => {
     if (!rooms[roomId]) {
-      rooms[roomId] = [{ socketId: socket.id, nickname }];
-      console.log(`Room ${roomId} created by ${nickname}`);
+      rooms[roomId] = [{ socketId: socket.id, nickname, role }];
+      console.log(`Room ${roomId} created by ${nickname} as ${role}`);
       socket.emit("roomCreated", { roomId });
     } else {
       socket.emit("roomExists", { roomId });
@@ -80,19 +80,36 @@ io.on("connection", (socket) => {
   });
 
   socket.on("joinRoom", (args) => {
-    const { roomId, nickname } = args;
+    const { roomId, nickname, role } = args;
 
-    if (rooms[roomId]) rooms[roomId].push({ socketId: socket.id, nickname });
-    else rooms[roomId] = [{ socketId: socket.id, nickname }];
+    if (rooms[roomId])
+      rooms[roomId].push({ socketId: socket.id, nickname, role });
+    else rooms[roomId] = [{ socketId: socket.id, nickname, role }];
 
     const otherUser = rooms[roomId].find((item) => item.socketId !== socket.id);
 
     if (otherUser && otherUser.socketId !== socket.id) {
-      socket.to(otherUser.socketId).emit("userJoined", {
-        otherUserSocketId: socket.id,
-        otherUserNickname: nickname,
-      });
-      socket.emit("waitingToBeAcceptedBy", otherUser.nickname);
+      // Only allow patients to request joining if the other user is a doctor
+      if (role === "patient" && otherUser.role === "doctor") {
+        socket.to(otherUser.socketId).emit("userJoined", {
+          otherUserSocketId: socket.id,
+          otherUserNickname: nickname,
+          otherUserRole: role,
+        });
+        socket.emit("waitingToBeAcceptedBy", otherUser.nickname);
+      } else if (role === "doctor" && otherUser.role === "patient") {
+        // If doctor joins after patient, automatically accept
+        socket.emit("otherUserId", {
+          otherUserSocketId: otherUser.socketId,
+          otherUserNickname: otherUser.nickname,
+          otherUserRole: otherUser.role,
+        });
+        socket.to(otherUser.socketId).emit("acceptedBy", nickname);
+      } else {
+        // If roles don't match, reject the connection
+        socket.emit("invalidRoleCombination");
+        rooms[roomId] = rooms[roomId].filter((el) => el.socketId !== socket.id);
+      }
     }
     console.log("joinRoom rooms: ", rooms);
   });
@@ -103,11 +120,18 @@ io.on("connection", (socket) => {
     const room = rooms[roomId];
     const otherUser = room.find((item) => item.socketId !== socket.id);
     if (otherUser) {
-      socket.emit("otherUserId", {
-        otherUserSocketId: otherUser.socketId,
-        otherUserNickname: otherUser.nickname,
-      });
-      socket.to(otherUser.socketId).emit("acceptedBy", nickname);
+      // Only allow doctors to accept calls
+      const currentUser = room.find((item) => item.socketId === socket.id);
+      if (currentUser?.role === "doctor" || "patient") {
+        socket.emit("otherUserId", {
+          otherUserSocketId: otherUser.socketId,
+          otherUserNickname: otherUser.nickname,
+          otherUserRole: otherUser.role,
+        });
+        socket.to(otherUser.socketId).emit("acceptedBy", nickname);
+      } else {
+        socket.emit("unauthorizedAcceptance");
+      }
     }
   });
 
